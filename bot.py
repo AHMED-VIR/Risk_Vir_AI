@@ -1,26 +1,29 @@
 import logging
 import os
+import base64
 from io import BytesIO
-from PIL import Image
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
-from google import genai
-from google.genai import types
+from key_manager import KeyManager
+import PyPDF2
+import docx
+from pptx import Presentation
+import pandas as pd
 
 # --- Configuration ---
 from dotenv import load_dotenv
 
 # Load environment variables
-load_dotenv()
+load_dotenv(override=True)
 
 # --- Configuration ---
 # Get tokens from environment variables
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "@RISK_VIR")
 
-if not TELEGRAM_BOT_TOKEN or not GEMINI_API_KEY:
-    raise ValueError("Missing API keys. Please set TELEGRAM_BOT_TOKEN and GEMINI_API_KEY in .env file.")
+if not TELEGRAM_BOT_TOKEN or not OPENAI_API_KEY:
+    raise ValueError("Missing API keys. Please set TELEGRAM_BOT_TOKEN and OPENAI_API_KEY in .env file.")
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -28,158 +31,186 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-# --- Gemini Client Setup (New SDK) ---
-client = genai.Client(api_key=GEMINI_API_KEY)
+# --- Keep Alive for Render (Free Tier) ---
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
+
+def start_health_server():
+    port = int(os.getenv("PORT", 8080))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    logging.info(f"Health check server started on port {port}")
+    try:
+        server.serve_forever()
+    except Exception as e:
+        logging.error(f"Health server failed: {e}")
+
+# Start the health server in the background
+threading.Thread(target=start_health_server, daemon=True).start()
+
+# --- OpenAI Client Setup ---
+key_manager = KeyManager()
 
 async def check_subscription(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
     Checks if the user is a member of the required channel.
     """
     try:
+        logging.info(f"Checking subscription for user {user_id} in {REQUIRED_CHANNEL}")
         member = await context.bot.get_chat_member(chat_id=REQUIRED_CHANNEL, user_id=user_id)
+        logging.info(f"Member status: {member.status}")
         if member.status in ['member', 'administrator', 'creator', 'restricted']:
             return True
         return False
     except Exception as e:
         logging.error(f"Error checking subscription for user {user_id}: {e}")
-        # If bot is not admin or channel is invalid, fail closed (restrict access) or open (allow).
-        # Returning False restricts access.
         return False
 
-async def get_gemini_response(user_query: str, image_data: BytesIO = None) -> str:
+def extract_text_from_file(file_stream: BytesIO, file_ext: str) -> str:
     """
-    Sends the user's query (and optional image) to Gemini API and returns the response.
-    Tries multiple model names to handle API variations.
+    Extracts text from PDF, DOCX, PPTX, XLSX, or TXT files.
     """
-    # List of models to try in order of preference
-    # List of models to try in order of preference
-    # Prioritizing Flash models for speed and higher rate limits on free tier
+    text = ""
+    try:
+        if file_ext == '.pdf':
+            reader = PyPDF2.PdfReader(file_stream)
+            for page in reader.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + "\n"
+        
+        elif file_ext == '.docx':
+            doc = docx.Document(file_stream)
+            for para in doc.paragraphs:
+                text += para.text + "\n"
+        
+        elif file_ext == '.pptx':
+            try:
+                prs = Presentation(file_stream)
+                for slide in prs.slides:
+                    for shape in slide.shapes:
+                        if hasattr(shape, "text"):
+                            text += shape.text + "\n"
+            except Exception as e:
+                return f"Error reading PowerPoint file: {e}"
+
+        elif file_ext in ['.xlsx', '.xls']:
+            try:
+                # Read all sheets, ensure openpyxl is used
+                # We need to install openpyxl if not present (added to requirements)
+                xls = pd.read_excel(file_stream, sheet_name=None, engine='openpyxl') 
+                for sheet_name, df in xls.items():
+                    text += f"--- Sheet: {sheet_name} ---\n"
+                    text += df.to_string() + "\n\n"
+            except Exception as e:
+                return f"Error reading Excel file: {e}"
+
+        elif file_ext == '.txt':
+            text = file_stream.read().decode('utf-8', errors='ignore')
+        else:
+            return "Unsupported file format."
+            
+    except Exception as e:
+        logging.error(f"Error extracting text from file: {e}")
+        return f"Error reading file: {e}"
+        
+    return text
+
+async def get_openai_response(user_query: str, image_data: BytesIO = None) -> str:
+    """
+    Sends the user's query (and optional image) to OpenAI API and returns the response.
+    """
+    client = key_manager.get_client()
+    
+    # List of models to try
     candidate_models = [
-        "gemini-2.5-flash",
-        "gemini-2.0-flash",
-        "gemini-2.5-pro",
-        "gemini-2.0-flash-001",
-        "gemini-flash-latest",
-        "gemini-pro-latest",
-        "gemini-1.5-flash",
-        "gemini-1.5-flash-001",
-        "gemini-1.5-flash-002",
-        "gemini-1.5-flash-8b",
-        "gemini-2.0-flash-exp",
+        "gpt-4o",
+        "gpt-4o-2024-11-20",
+        "gpt-4o-2024-08-06",
+        "gpt-4o-2024-05-13",
+        "gpt-4o-mini",
+        "gpt-4o-mini-2024-07-18",
+        "gpt-3.5-turbo",
+        "gpt-3.5-turbo-0125",
+        "gpt-3.5-turbo-1106",
+        "gpt-3.5-turbo-16k",
+        "gpt-3.5-turbo-instruct", # Uses completions endpoint typically, but might work or fail fast
+        "o1-2024-12-17",
+        "o1",
+        "o3-mini",
+        "o3-mini-2025-01-31",
+        "gpt-4.1", 
+        "chatgpt-image-latest", # Vision?
+        # Fallbacks
+        "gpt-4",
     ]
-
+    
     last_error = None
-
+    
     for model_name in candidate_models:
+        # If we have an image, skip models that don't support vision
+        if image_data:
+            if "gpt-4o" not in model_name and "gpt-4-turbo" not in model_name:
+                continue
+
         try:
             if image_data:
-                # Open image with PIL (reset buffer position if needed, though usually fine)
+                # Encode image to base64
                 image_data.seek(0)
-                image = Image.open(image_data)
+                base64_image = base64.b64encode(image_data.read()).decode('utf-8')
                 
-                # If query is empty, provide a default prompt
                 prompt_text = user_query if user_query else "Describe this image."
                 
-                response = client.models.generate_content(
+                # Vision API call
+                response = client.chat.completions.create(
                     model=model_name,
-                    contents=[prompt_text, image]
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt_text},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/jpeg;base64,{base64_image}"
+                                    }
+                                }
+                            ]
+                        }
+                    ],
+                    max_tokens=4096
                 )
             else:
                 if not user_query:
                     return "Please send a message."
 
-                response = client.models.generate_content(
+                response = client.chat.completions.create(
                     model=model_name,
-                    contents=user_query
+                    messages=[
+                        {"role": "user", "content": user_query}
+                    ],
+                    max_tokens=4096
                 )
             
             # If successful, return immediately
-            return response.text
+            return response.choices[0].message.content
 
         except Exception as e:
             logging.warning(f"Failed with model {model_name}: {e}")
             last_error = e
             continue
-    
+
     # If all failed
-    logging.error(f"All Gemini models failed. Last error: {last_error}")
-    return f"عذراً، حدث خطأ أثناء الاتصال بـ Gemini API.\nفشلت جميع المحاولات.\nالخطأ الأخير: {last_error}"
+    logging.error(f"All OpenAI models failed. Last error: {last_error}")
+    return f"عذراً، حدث خطأ أثناء الاتصال بـ OpenAI API.\nالخطأ: {last_error}"
 
-
-async def get_image_generation(user_prompt: str) -> BytesIO:
-    """
-    Generates an image using Imagen model.
-    """
-    try:
-        # Use a model from the list provided by user, start with the fast one
-        model_name = "imagen-4.0-fast-generate-001"
-        
-        response = client.models.generate_images(
-            model=model_name,
-            prompt=user_prompt,
-            config=types.GenerateImagesConfig(
-                number_of_images=1,
-            )
-        )
-        
-        # Access the first generated image
-        if response.generated_images:
-            image_bytes = response.generated_images[0].image.image_bytes
-            return BytesIO(image_bytes)
-        return None
-    except Exception as e:
-        logging.error(f"Error generating image: {e}")
-        return None
 
 # --- Telegram Bot Handlers ---
-
-async def generate_image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handler for /image command.
-    """
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
-
-    is_member = await check_subscription(user_id, context)
-    if not is_member:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"⚠️ **عذراً، يجب عليك الاشتراك في القناة أولاً:**\n{REQUIRED_CHANNEL}"
-        )
-        return
-
-    # Extract prompt
-    if not context.args:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="يرجى كتابة وصف للصورة بعد الأمر، مثال:\n`/image قطة تركب دراجة`",
-            parse_mode='Markdown'
-        )
-        return
-
-    user_prompt = " ".join(context.args)
-    
-    await context.bot.send_chat_action(chat_id=chat_id, action='upload_photo')
-    
-    try:
-        image_data = await get_image_generation(user_prompt)
-        
-        if image_data:
-            await context.bot.send_photo(
-                chat_id=chat_id,
-                photo=image_data,
-                caption=f"🎨 **Generated Image**\nPromp: {user_prompt}"
-            )
-        else:
-             await context.bot.send_message(
-                chat_id=chat_id,
-                text="عذراً، لم أتمكن من إنشاء الصورة. يرجى المحاولة مرة أخرى لاحقاً."
-            )
-    except Exception as e:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"حدث خطأ: {e}"
-        )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -188,8 +219,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
 
+    logging.info(f"Start command received from {user_id}")
     is_member = await check_subscription(user_id, context)
     if not is_member:
+        logging.info(f"User {user_id} is NOT a member")
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
@@ -203,17 +236,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(
         chat_id=chat_id,
         text=(
-            "مرحباً! أنا بوت ذكي يعمل بواسطة Google Gemini AI. 🤖✨\n\n"
+            "مرحباً! أنا بوت ذكي يعمل بواسطة OpenAI GPT. 🤖✨\n\n"
             "💬 **للمحادثة:** أرسل أي نص أو سؤال.\n"
             "📸 **لتحليل الصور:** أرسل صورة وسأصفها لك.\n"
-            "🎨 **لإنشاء الصور:** استخدم الأمر `/image` متبوعاً بالوصف.\n"
-            "   مثال: `/image منظر طبيعي للجبال وقت الغروب`"
+            "📂 **لقراءة الملفات:** أرسل ملف (PDF, Word, Excel, PowerPoint, TXT) وسأقوم بتلخيصه أو الإجابة عنه.\n"
         )
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Handler for text messages and photos.
+    Handler for text messages, photos, and documents.
     """
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
@@ -247,7 +279,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         img_buffer.seek(0)
         
         # Use caption as text if available
-        user_text = update.message.caption
+        user_text = update.message.caption or ""
+        if not user_text:
+             user_text = "Describe this image."
+
+    # Handle Document
+    elif update.message.document:
+        doc_file = await update.message.document.get_file()
+        file_name = update.message.document.file_name
+        file_ext = os.path.splitext(file_name)[1].lower()
+        
+        supported_exts = ['.pdf', '.docx', '.pptx', '.xlsx', '.xls', '.txt']
+        if file_ext not in supported_exts:
+             await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"⚠️ **عذراً، هذا النوع من الملفات غير مدعوم.**\nأقبل الملفات التالية: {', '.join(supported_exts)}"
+            )
+             return
+
+        # Download into memory
+        doc_buffer = BytesIO()
+        await doc_file.download_to_memory(out=doc_buffer)
+        doc_buffer.seek(0)
+        
+        extracted_text = extract_text_from_file(doc_buffer, file_ext)
+        
+        user_caption = update.message.caption or ""
+        # Limit text size significantly for Excel files which can be huge
+        limit = 30000 
+        user_text = f"Here is the content of the file '{file_name}':\n\n{extracted_text[:limit]}\n\nUser Question: {user_caption}"
     
     # Handle Text
     elif update.message.text:
@@ -256,14 +316,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         return
 
-    # Get response from Gemini
-    response_text = await get_gemini_response(user_text, img_buffer)
+    # Get response from OpenAI
+    logging.info(f"Sending text to OpenAI: {user_text[:50]}...")
+    response_text = await get_openai_response(user_text, img_buffer)
+    logging.info("Received response from OpenAI")
 
     # Send the response back to the user
     await context.bot.send_message(
         chat_id=chat_id,
         text=response_text
     )
+    logging.info("Sent response to user")
 
 # --- Main Execution ---
 
@@ -276,11 +339,10 @@ if __name__ == '__main__':
 
         # Add handlers
         start_handler = CommandHandler('start', start)
-        image_handler = CommandHandler('image', generate_image_command)
-        message_handler = MessageHandler((filters.TEXT | filters.PHOTO) & (~filters.COMMAND), handle_message)
+        message_handler = MessageHandler((filters.TEXT | filters.PHOTO | filters.Document.ALL) & (~filters.COMMAND), handle_message)
 
         application.add_handler(start_handler)
-        application.add_handler(image_handler)
+        # Removed image_handler
         application.add_handler(message_handler)
 
         print("Bot is polling...")

@@ -2,3 +2,8 @@ python-telegram-bot
 google-genai
 pillow
 python-dotenv
+PyPDF2
+python-docx
+python-pptx
+openpyxl
+pandas

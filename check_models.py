@@ -1,19 +1,17 @@
-from google import genai
 import os
+from openai import OpenAI
+from dotenv import load_dotenv
 
-# Gemini API Key
-GEMINI_API_KEY = "AIzaSyBTJdeA1Hp9v9me5fpRL1j4Yt5WHjO-3Wg"
+load_dotenv(override=True)
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+api_key = os.getenv("OPENAI_API_KEY")
+print(f"Checking key: {api_key[:10]}...")
 
 try:
-    print("Listing models...")
-    # List models that support generateContent
-    for model in client.models.list(config={"query_base": True}):
-        print(f"Model: {model.name}")
-        print(f"  DisplayName: {model.display_name}")
-        print(f"  Supported Actions: {model.supported_actions}")
-        print("-" * 20)
-        
+    client = OpenAI(api_key=api_key)
+    models = client.models.list()
+    print("Available models:")
+    for model in models:
+        print(f"- {model.id}")
 except Exception as e:
     print(f"Error listing models: {e}")
