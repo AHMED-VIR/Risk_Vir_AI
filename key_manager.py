@@ -11,7 +11,8 @@ class KeyManager:
     def __init__(self):
         self.api_keys = self._load_keys()
         self.current_key_index = 0
-        self.clients = [OpenAI(api_key=key) for key in self.api_keys]
+        # Disable built-in retries so we can control rotation manually
+        self.clients = [OpenAI(api_key=key, max_retries=0) for key in self.api_keys]
         
         if not self.clients:
             raise ValueError("No API keys found in .env under OPENAI_API_KEY")
@@ -27,6 +28,10 @@ class KeyManager:
             # Split by comma and strip whitespace
             return [k.strip() for k in keys_str.split(',') if k.strip()]
         return []
+    
+    @property
+    def client_count(self) -> int:
+        return len(self.clients)
 
     def get_client(self) -> OpenAI:
         """Returns the next OpenAI client in rotation."""

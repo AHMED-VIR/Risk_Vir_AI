@@ -158,52 +158,64 @@ async def get_openai_response(user_query: str, image_data: BytesIO = None) -> st
             if "gpt-4o" not in model_name and "gpt-4-turbo" not in model_name:
                 continue
 
-        try:
-            if image_data:
-                # Encode image to base64
-                image_data.seek(0)
-                base64_image = base64.b64encode(image_data.read()).decode('utf-8')
-                
-                prompt_text = user_query if user_query else "Describe this image."
-                
-                # Vision API call
-                response = client.chat.completions.create(
-                    model=model_name,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": prompt_text},
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": f"data:image/jpeg;base64,{base64_image}"
+        # Try with current key, and if it fails with quota error, rotate and retry
+        # We try up to client_count times for each model
+        for attempt in range(key_manager.client_count):
+            client = key_manager.get_client()
+            try:
+                if image_data:
+                    # Encode image to base64
+                    image_data.seek(0)
+                    base64_image = base64.b64encode(image_data.read()).decode('utf-8')
+                    
+                    prompt_text = user_query if user_query else "Describe this image."
+                    
+                    # Vision API call
+                    response = client.chat.completions.create(
+                        model=model_name,
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": prompt_text},
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": f"data:image/jpeg;base64,{base64_image}"
+                                        }
                                     }
-                                }
-                            ]
-                        }
-                    ],
-                    max_tokens=4096
-                )
-            else:
-                if not user_query:
-                    return "Please send a message."
+                                ]
+                            }
+                        ],
+                        max_tokens=4096
+                    )
+                else:
+                    if not user_query:
+                        return "Please send a message."
 
-                response = client.chat.completions.create(
-                    model=model_name,
-                    messages=[
-                        {"role": "user", "content": user_query}
-                    ],
-                    max_tokens=4096
-                )
-            
-            # If successful, return immediately
-            return response.choices[0].message.content
+                    response = client.chat.completions.create(
+                        model=model_name,
+                        messages=[
+                            {"role": "user", "content": user_query}
+                        ],
+                        max_tokens=4096
+                    )
+                
+                # If successful, return immediately
+                return response.choices[0].message.content
 
-        except Exception as e:
-            logging.warning(f"Failed with model {model_name}: {e}")
-            last_error = e
-            continue
+            except Exception as e:
+                # Check for Quota Error (429) or Insufficient Quota
+                error_msg = str(e).lower()
+                if "429" in error_msg or "insufficient_quota" in error_msg:
+                    logging.warning(f"Quota exceeded for model {model_name} with one key. Rotating to next key. Error: {e}")
+                    # The loop will continue and get_client() will provide the next key
+                    continue
+                else:
+                    # For other errors, log and try next model
+                    logging.warning(f"Failed with model {model_name}: {e}")
+                    last_error = e
+                    break # Break inner loop to switch model
 
     # If all failed
     logging.error(f"All OpenAI models failed. Last error: {last_error}")
