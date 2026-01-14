@@ -9,6 +9,7 @@ import PyPDF2
 import docx
 from pptx import Presentation
 import pandas as pd
+from PIL import Image
 
 # --- Configuration ---
 from dotenv import load_dotenv
@@ -121,6 +122,29 @@ def extract_text_from_file(file_stream: BytesIO, file_ext: str) -> str:
         
     return text
 
+def resize_image(image_data: BytesIO, max_size=(1024, 1024)) -> BytesIO:
+    """
+    Resizes the image to fit within max_size while maintaining aspect ratio.
+    """
+    try:
+        image_data.seek(0)
+        with Image.open(image_data) as img:
+            # Convert to RGB if necessary (e.g. for PNGs with transparency)
+            if img.mode in ("RGBA", "P"):
+                img = img.convert("RGB")
+            
+            img.thumbnail(max_size)
+            
+            output = BytesIO()
+            img.save(output, format="JPEG", quality=85)
+            output.seek(0)
+            return output
+    except Exception as e:
+        logging.error(f"Error resizing image: {e}")
+        # Return original if resizing fails
+        image_data.seek(0)
+        return image_data
+
 async def get_openai_response(user_query: str, image_data: BytesIO = None) -> str:
     """
     Sends the user's query (and optional image) to OpenAI API and returns the response.
@@ -164,9 +188,12 @@ async def get_openai_response(user_query: str, image_data: BytesIO = None) -> st
             client = key_manager.get_client()
             try:
                 if image_data:
+                    # Resize image first
+                    resized_image = resize_image(image_data)
+                    
                     # Encode image to base64
-                    image_data.seek(0)
-                    base64_image = base64.b64encode(image_data.read()).decode('utf-8')
+                    resized_image.seek(0)
+                    base64_image = base64.b64encode(resized_image.read()).decode('utf-8')
                     
                     prompt_text = user_query if user_query else "Describe this image."
                     
@@ -205,10 +232,12 @@ async def get_openai_response(user_query: str, image_data: BytesIO = None) -> st
                 return response.choices[0].message.content
 
             except Exception as e:
-                # Check for Quota Error (429) or Insufficient Quota
+                # Check for Quota Error (429), Insufficient Quota, or Connection Error
                 error_msg = str(e).lower()
-                if "429" in error_msg or "insufficient_quota" in error_msg:
-                    logging.warning(f"Quota exceeded for model {model_name} with one key. Rotating to next key. Error: {e}")
+                retry_errors = ["429", "insufficient_quota", "connection error", "timeout", "request timed out"]
+                
+                if any(err in error_msg for err in retry_errors):
+                    logging.warning(f"Optimization/Error for model {model_name} with one key. Rotating to next key. Type: {error_msg}. Error: {e}")
                     # The loop will continue and get_client() will provide the next key
                     continue
                 else:
